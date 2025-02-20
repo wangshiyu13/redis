@@ -2,8 +2,13 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ *
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
 #include "server.h"
@@ -2332,6 +2337,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 rdbReportCorruptRDB("invalid expireAt time: %llu",
                                     (unsigned long long) expireAt);
                 decrRefCount(o);
+                if (dupSearchDict != NULL) dictRelease(dupSearchDict);
                 return NULL;
             }
 
@@ -3161,7 +3167,13 @@ emptykey:
 /* Mark that we are loading in the global state and setup the fields
  * needed to provide loading stats. */
 void startLoading(size_t size, int rdbflags, int async) {
-    /* Load the DB */
+    loadingSetFlags(NULL, size, async);
+    loadingFireEvent(rdbflags);
+}
+
+/* Initialize stats, set loading flags and filename if provided. */
+void loadingSetFlags(char *filename, size_t size, int async) {
+    rdbFileBeingLoaded = filename;
     server.loading = 1;
     if (async == 1) server.async_loading = 1;
     server.loading_start_time = time(NULL);
@@ -3171,7 +3183,9 @@ void startLoading(size_t size, int rdbflags, int async) {
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
     blockingOperationStarts();
+}
 
+void loadingFireEvent(int rdbflags) {
     /* Fire the loading modules start event. */
     int subevent;
     if (rdbflags & RDBFLAGS_AOF_PREAMBLE)
@@ -3187,8 +3201,8 @@ void startLoading(size_t size, int rdbflags, int async) {
  * needed to provide loading stats.
  * 'filename' is optional and used for rdb-check on error */
 void startLoadingFile(size_t size, char* filename, int rdbflags) {
-    rdbFileBeingLoaded = filename;
-    startLoading(size, rdbflags, 0);
+    loadingSetFlags(filename, size, 0);
+    loadingFireEvent(rdbflags);
 }
 
 /* Refresh the absolute loading progress info */
@@ -3702,14 +3716,21 @@ eoferr:
     return C_ERR;
 }
 
+int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    return rdbLoadWithEmptyFunc(filename, rsi, rdbflags, NULL);
+}
+
 /* Like rdbLoadRio() but takes a filename instead of a rio stream. The
  * filename is open for reading and a rio stream object created in order
  * to do the actual loading. Moreover the ETA displayed in the INFO
  * output is initialized and finalized.
  *
  * If you pass an 'rsi' structure initialized with RDB_SAVE_INFO_INIT, the
- * loading code will fill the information fields in the structure. */
-int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
+ * loading code will fill the information fields in the structure.
+ *
+ * If emptyDbFunc is not NULL, it will be called to flush old db or to
+ * discard partial db on error. */
+int rdbLoadWithEmptyFunc(char *filename, rdbSaveInfo *rsi, int rdbflags, void (*emptyDbFunc)(void)) {
     FILE *fp;
     rio rdb;
     int retval;
@@ -3727,12 +3748,20 @@ int rdbLoad(char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (fstat(fileno(fp), &sb) == -1)
         sb.st_size = 0;
 
-    startLoadingFile(sb.st_size, filename, rdbflags);
+    loadingSetFlags(filename, sb.st_size, 0);
+    /* Note that inside loadingSetFlags(), server.loading is set.
+     * emptyDbCallback() may yield back to event-loop to reply -LOADING. */
+    if (emptyDbFunc)
+        emptyDbFunc(); /* Flush existing db. */
+    loadingFireEvent(rdbflags);
     rioInitWithFile(&rdb,fp);
 
     retval = rdbLoadRio(&rdb,rdbflags,rsi);
 
     fclose(fp);
+    if (retval != C_OK && emptyDbFunc)
+        emptyDbFunc(); /* Clean up partial db. */
+
     stopLoading(retval==C_OK);
     /* Reclaim the cache backed by rdb */
     if (retval == C_OK && !(rdbflags & RDBFLAGS_KEEP_CACHE)) {
@@ -3786,8 +3815,10 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
     }
     if (server.rdb_child_exit_pipe!=-1)
         close(server.rdb_child_exit_pipe);
-    aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
-    close(server.rdb_pipe_read);
+    if (server.rdb_pipe_read != -1) {
+        aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
+        close(server.rdb_pipe_read);
+    }
     server.rdb_child_exit_pipe = -1;
     server.rdb_pipe_read = -1;
     zfree(server.rdb_pipe_conns);
@@ -3851,7 +3882,8 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listNode *ln;
     listIter li;
     pid_t childpid;
-    int pipefds[2], rdb_pipe_write, safe_to_exit_pipe;
+    int pipefds[2], rdb_pipe_write = 0, safe_to_exit_pipe = 0;
+    int rdb_channel = (req & SLAVE_REQ_RDB_CHANNEL);
 
     if (hasActiveChildProcess()) return C_ERR;
 
@@ -3859,29 +3891,30 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
      * drained the pipe. */
     if (server.rdb_pipe_conns) return C_ERR;
 
-    /* Before to fork, create a pipe that is used to transfer the rdb bytes to
-     * the parent, we can't let it write directly to the sockets, since in case
-     * of TLS we must let the parent handle a continuous TLS state when the
-     * child terminates and parent takes over. */
-    if (anetPipe(pipefds, O_NONBLOCK, 0) == -1) return C_ERR;
-    server.rdb_pipe_read = pipefds[0]; /* read end */
-    rdb_pipe_write = pipefds[1]; /* write end */
+    if (!rdb_channel) {
+        /* Before to fork, create a pipe that is used to transfer the rdb bytes to
+         * the parent, we can't let it write directly to the sockets, since in case
+         * of TLS we must let the parent handle a continuous TLS state when the
+         * child terminates and parent takes over. */
+        if (anetPipe(pipefds, O_NONBLOCK, 0) == -1) return C_ERR;
+        server.rdb_pipe_read = pipefds[0]; /* read end */
+        rdb_pipe_write = pipefds[1]; /* write end */
 
-    /* create another pipe that is used by the parent to signal to the child
-     * that it can exit. */
-    if (anetPipe(pipefds, 0, 0) == -1) {
-        close(rdb_pipe_write);
-        close(server.rdb_pipe_read);
-        return C_ERR;
+        /* create another pipe that is used by the parent to signal to the child
+         * that it can exit. */
+        if (anetPipe(pipefds, 0, 0) == -1) {
+            close(rdb_pipe_write);
+            close(server.rdb_pipe_read);
+            return C_ERR;
+        }
+        safe_to_exit_pipe = pipefds[0]; /* read end */
+        server.rdb_child_exit_pipe = pipefds[1]; /* write end */
     }
-    safe_to_exit_pipe = pipefds[0]; /* read end */
-    server.rdb_child_exit_pipe = pipefds[1]; /* write end */
 
     /* Collect the connections of the replicas we want to transfer
-     * the RDB to, which are i WAIT_BGSAVE_START state. */
-    server.rdb_pipe_conns = zmalloc(sizeof(connection *)*listLength(server.slaves));
-    server.rdb_pipe_numconns = 0;
-    server.rdb_pipe_numconns_writing = 0;
+     * the RDB to, which are in WAIT_BGSAVE_START state. */
+    int numconns = 0;
+    connection **conns = zmalloc(sizeof(*conns) * listLength(server.slaves));
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
@@ -3889,9 +3922,20 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
             /* Check slave has the exact requirements */
             if (slave->slave_req != req)
                 continue;
-            server.rdb_pipe_conns[server.rdb_pipe_numconns++] = slave->conn;
-            replicationSetupSlaveForFullResync(slave,getPsyncInitialOffset());
+            replicationSetupSlaveForFullResync(slave, getPsyncInitialOffset());
+            conns[numconns++] = slave->conn;
+            if (rdb_channel) {
+                /* Put the socket in blocking mode to simplify RDB transfer. */
+                connSendTimeout(slave->conn, server.repl_timeout * 1000);
+                connBlock(slave->conn);
+            }
         }
+    }
+
+    if (!rdb_channel) {
+        server.rdb_pipe_conns = conns;
+        server.rdb_pipe_numconns = numconns;
+        server.rdb_pipe_numconns_writing = 0;
     }
 
     /* Create the child process. */
@@ -3900,11 +3944,14 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         int retval, dummy;
         rio rdb;
 
-        rioInitWithFd(&rdb,rdb_pipe_write);
-
-        /* Close the reading part, so that if the parent crashes, the child will
-         * get a write error and exit. */
-        close(server.rdb_pipe_read);
+        if (rdb_channel) {
+            rioInitWithConnset(&rdb, conns, numconns);
+        } else {
+            rioInitWithFd(&rdb,rdb_pipe_write);
+            /* Close the reading part, so that if the parent crashes, the child
+             * will get a write error and exit. */
+            close(server.rdb_pipe_read);
+        }
 
         redisSetProcTitle("redis-rdb-to-slaves");
         redisSetCpuAffinity(server.bgsave_cpulist);
@@ -3917,14 +3964,19 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
             sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
         }
 
-        rioFreeFd(&rdb);
-        /* wake up the reader, tell it we're done. */
-        close(rdb_pipe_write);
-        close(server.rdb_child_exit_pipe); /* close write end so that we can detect the close on the parent. */
-        /* hold exit until the parent tells us it's safe. we're not expecting
-         * to read anything, just get the error when the pipe is closed. */
-        dummy = read(safe_to_exit_pipe, pipefds, 1);
-        UNUSED(dummy);
+        if (rdb_channel) {
+            rioFreeConnset(&rdb);
+        } else {
+            rioFreeFd(&rdb);
+            /* wake up the reader, tell it we're done. */
+            close(rdb_pipe_write);
+            close(server.rdb_child_exit_pipe); /* close write end so that we can detect the close on the parent. */
+            /* hold exit until the parent tells us it's safe. we're not expecting
+             * to read anything, just get the error when the pipe is closed. */
+            dummy = read(safe_to_exit_pipe, pipefds, 1);
+            UNUSED(dummy);
+        }
+        zfree(conns);
         exitFromChild((retval == C_OK) ? 0 : 1);
     } else {
         /* Parent */
@@ -3942,24 +3994,33 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
                     slave->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
                 }
             }
-            close(rdb_pipe_write);
-            close(server.rdb_pipe_read);
-            close(server.rdb_child_exit_pipe);
-            zfree(server.rdb_pipe_conns);
-            server.rdb_pipe_conns = NULL;
-            server.rdb_pipe_numconns = 0;
-            server.rdb_pipe_numconns_writing = 0;
+
+            if (!rdb_channel)  {
+                close(rdb_pipe_write);
+                close(server.rdb_pipe_read);
+                close(server.rdb_child_exit_pipe);
+                zfree(server.rdb_pipe_conns);
+                server.rdb_pipe_conns = NULL;
+                server.rdb_pipe_numconns = 0;
+                server.rdb_pipe_numconns_writing = 0;
+            }
         } else {
-            serverLog(LL_NOTICE,"Background RDB transfer started by pid %ld",
-                (long) childpid);
+            serverLog(LL_NOTICE, "Background RDB transfer started by pid %ld to %s", (long)childpid,
+                      rdb_channel ? "replica socket" : "parent process pipe");
             server.rdb_save_time_start = time(NULL);
             server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
-            close(rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
-            if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler,NULL) == AE_ERR) {
-                serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
+            if (!rdb_channel) {
+                close(rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
+                if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler,NULL) == AE_ERR) {
+                    serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
+                }
             }
         }
-        close(safe_to_exit_pipe);
+        if (rdb_channel)
+            zfree(conns);
+        else
+            close(safe_to_exit_pipe);
+
         return (childpid == -1) ? C_ERR : C_OK;
     }
     return C_OK; /* Unreached. */

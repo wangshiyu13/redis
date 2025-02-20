@@ -2,6 +2,9 @@
  * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
+ *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  *
@@ -15,6 +18,7 @@
 #include "bio.h"
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "script.h"
@@ -393,6 +397,8 @@ void debugCommand(client *c) {
 "    Hard crash and restart after a <milliseconds> delay (default 0).",
 "DIGEST",
 "    Output a hex signature representing the current DB content.",
+"INTERNAL_SECRET",
+"    Return the cluster internal secret (hashed with crc16) or error if not in cluster mode.",
 "DIGEST-VALUE <key> [<key> ...]",
 "    Output a hex signature of the values of all the specified keys.",
 "ERROR <string>",
@@ -482,10 +488,14 @@ void debugCommand(client *c) {
 "    In case RESET is provided the peak reset time will be restored to the default value",
 "REPLYBUFFER RESIZING <0|1>",
 "    Enable or disable the reply buffer resize cron job",
+"REPL-PAUSE <clear|after-fork|before-rdb-channel|on-streaming-repl-buf>",
+"    Pause the server's main process during various replication steps.",
 "DICT-RESIZING <0|1>",
 "    Enable or disable the main dict and expire dict resizing.",
 "SCRIPT <LIST|<sha>>",
 "    Output SHA and content of all scripts or of a specific script with its SHA.",
+"MARK-INTERNAL-CLIENT [UNMARK]",
+"    Promote the current connection to an internal connection.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -567,6 +577,7 @@ NULL
             addReplyError(c,"Error trying to load the RDB dump, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         serverLog(LL_NOTICE,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
@@ -582,6 +593,7 @@ NULL
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         server.dirty = 0; /* Prevent AOF / replication */
         serverLog(LL_NOTICE,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
@@ -751,6 +763,15 @@ NULL
         for (int i = 0; i < 20; i++) d = sdscatprintf(d, "%02x",digest[i]);
         addReplyStatus(c,d);
         sdsfree(d);
+    } else if (!strcasecmp(c->argv[1]->ptr,"internal_secret") && c->argc == 2) {
+        size_t len;
+        const char *internal_secret = clusterGetSecret(&len);
+        if (!internal_secret) {
+            addReplyError(c, "Internal secret is missing");
+        } else {
+            uint16_t hash = crc16(internal_secret, len);
+            addReplyLongLong(c, hash);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key key ... key. */
         addReplyArrayLen(c,c->argc-2);
@@ -831,7 +852,7 @@ NULL
             addReplyError(c,"Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"sleep") && c->argc == 3) {
-        double dtime = strtod(c->argv[2]->ptr,NULL);
+        double dtime = fast_float_strtod(c->argv[2]->ptr,NULL);
         long long utime = dtime*1000000;
         struct timespec tv;
 
@@ -1015,6 +1036,20 @@ NULL
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "repl-pause") && c->argc == 3) {
+        if (!strcasecmp(c->argv[2]->ptr, "clear")) {
+            server.repl_debug_pause = REPL_DEBUG_PAUSE_NONE;
+        } else if (!strcasecmp(c->argv[2]->ptr,"after-fork")) {
+            server.repl_debug_pause |= REPL_DEBUG_AFTER_FORK;
+        } else if (!strcasecmp(c->argv[2]->ptr,"before-rdb-channel")) {
+            server.repl_debug_pause |= REPL_DEBUG_BEFORE_RDB_CHANNEL;
+        } else if (!strcasecmp(c->argv[2]->ptr, "on-streaming-repl-buf")) {
+            server.repl_debug_pause |= REPL_DEBUG_ON_STREAMING_REPL_BUF;
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
         server.dict_resizing = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
@@ -1041,6 +1076,17 @@ NULL
             return;
         }
         addReply(c,shared.ok);
+    } else if(!strcasecmp(c->argv[1]->ptr,"mark-internal-client") && c->argc < 4) {
+        if (c->argc == 2) {
+            c->flags |= CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "unmark")) {
+            c->flags &= ~CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
@@ -1048,6 +1094,46 @@ NULL
 }
 
 /* =========================== Crash handling  ============================== */
+
+/* When hide-user-data-from-log is enabled, to avoid leaking user info, we only
+ * print tokens of the current command into the log. First, we collect command
+ * tokens into this struct (Commands tokens are defined in json schema). Later,
+ * checking each argument against the token list. */
+#define CMD_TOKEN_MAX_COUNT 128 /* Max token count in a command's json schema */
+struct cmdToken {
+    const char *tokens[CMD_TOKEN_MAX_COUNT];
+    int n_token;
+};
+
+/* Collect tokens from command arguments recursively. */
+static void cmdTokenCollect(struct cmdToken *tk, redisCommandArg *args, int argc) {
+    if (args == NULL)
+        return;
+
+    for (int i = 0; i < argc && tk->n_token < CMD_TOKEN_MAX_COUNT; i++) {
+        if (args[i].token)
+            tk->tokens[tk->n_token++] = args[i].token;
+        cmdTokenCollect(tk, args[i].subargs, args[i].num_args);
+    }
+}
+
+/* Get tokens of the command. */
+static void cmdTokenGetFromCommand(struct cmdToken *tk, struct redisCommand *cmd) {
+    tk->n_token = 0;
+    cmdTokenCollect(tk, cmd->args, cmd->num_args);
+}
+
+/* Check if object is one of command's tokens. */
+static int cmdTokenCheck(struct cmdToken *tk, robj *o) {
+    if (o->type != OBJ_STRING || !sdsEncodedObject(o))
+        return 0;
+
+    for (int i = 0; i < tk->n_token; i++) {
+        if (strcasecmp(tk->tokens[i], o->ptr) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 __attribute__ ((noinline))
 void _serverAssert(const char *estr, const char *file, int line) {
@@ -1069,27 +1155,34 @@ void _serverAssert(const char *estr, const char *file, int line) {
     bugReportEnd(0, 0);
 }
 
-/* Returns the amount of client's command arguments we allow logging */
-int clientArgsToLog(const client *c) {
-    return server.hide_user_data_from_log ? 1 : c->argc;
-}
-
 void _serverAssertPrintClientInfo(const client *c) {
     int j;
     char conninfo[CONN_INFO_LEN];
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     bugReportStart();
     serverLog(LL_WARNING,"=== ASSERTION FAILED CLIENT CONTEXT ===");
     serverLog(LL_WARNING,"client->flags = %llu", (unsigned long long) c->flags);
     serverLog(LL_WARNING,"client->conn = %s", connGetInfo(c->conn, conninfo, sizeof(conninfo)));
     serverLog(LL_WARNING,"client->argc = %d", c->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(c->argv, c->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j=0; j < c->argc; j++) {
-        if (j >= clientArgsToLog(c)) {
-            serverLog(LL_WARNING,"client->argv[%d] = *redacted*",j);
-            continue;
-        }
         char buf[128];
         char *arg;
+
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, c->argv[j])) {
+                serverLog(LL_WARNING, "client->argv[%d] = *redacted*", j);
+                continue;
+            }
+        }
 
         if (c->argv[j]->type == OBJ_STRING && sdsEncodedObject(c->argv[j])) {
             arg = (char*) c->argv[j]->ptr;
@@ -2058,16 +2151,27 @@ void logCurrentClient(client *cc, const char *title) {
 
     sds client;
     int j;
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     serverLog(LL_WARNING|LL_RAW, "\n------ %s CLIENT INFO ------\n", title);
     client = catClientInfoString(sdsempty(),cc);
     serverLog(LL_WARNING|LL_RAW,"%s\n", client);
     sdsfree(client);
     serverLog(LL_WARNING|LL_RAW,"argc: '%d'\n", cc->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(cc->argv, cc->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j = 0; j < cc->argc; j++) {
-        if (j >= clientArgsToLog(cc)) {
-            serverLog(LL_WARNING|LL_RAW,"argv[%d]: *redacted*\n",j);
-            continue;
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, cc->argv[j])) {
+                serverLog(LL_WARNING|LL_RAW, "argv[%d]: '*redacted*'\n", j);
+                continue;
+            }
         }
         robj *decoded;
         decoded = getDecodedObject(cc->argv[j]);
@@ -2390,6 +2494,8 @@ void removeSigSegvHandlers(void) {
 }
 
 void printCrashReport(void) {
+    server.crashing = 1;
+
     /* Log INFO and CLIENT LIST */
     logServerInfo();
 
@@ -2518,6 +2624,12 @@ void applyWatchdogPeriod(void) {
         if (server.watchdog_period < min_period) server.watchdog_period = min_period;
         watchdogScheduleSignal(server.watchdog_period); /* Adjust the current timer. */
     }
+}
+
+void debugPauseProcess(void) {
+    serverLog(LL_NOTICE, "Process is about to stop.");
+    raise(SIGSTOP);
+    serverLog(LL_NOTICE, "Process has been continued.");
 }
 
 /* Positive input is sleep time in microseconds. Negative input is fractions

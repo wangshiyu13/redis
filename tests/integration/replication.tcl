@@ -1,3 +1,16 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of the Redis Source Available License 2.0
+# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 proc log_file_matches {log pattern} {
     set fp [open $log r]
     set content [read $fp]
@@ -303,7 +316,7 @@ start_server {tags {"repl external:skip"}} {
     }
 }
 
-foreach mdl {no yes} {
+foreach mdl {no yes} rdbchannel {no yes} {
     foreach sdl {disabled swapdb} {
         start_server {tags {"repl external:skip"} overrides {save {}}} {
             set master [srv 0 client]
@@ -319,7 +332,13 @@ foreach mdl {no yes} {
                     lappend slaves [srv 0 client]
                     start_server {overrides {save {}}} {
                         lappend slaves [srv 0 client]
-                        test "Connect multiple replicas at the same time (issue #141), master diskless=$mdl, replica diskless=$sdl" {
+                        test "Connect multiple replicas at the same time (issue #141), master diskless=$mdl, replica diskless=$sdl, rdbchannel=$rdbchannel" {
+
+                            $master config set repl-rdb-channel $rdbchannel
+                            [lindex $slaves 0] config set repl-rdb-channel $rdbchannel
+                            [lindex $slaves 1] config set repl-rdb-channel $rdbchannel
+                            [lindex $slaves 2] config set repl-rdb-channel $rdbchannel
+
                             # start load handles only inside the test, so that the test can be skipped
                             set load_handle0 [start_bg_complex_data $master_host $master_port 9 100000000]
                             set load_handle1 [start_bg_complex_data $master_host $master_port 11 100000000]
@@ -438,7 +457,7 @@ start_server {tags {"repl external:skip"} overrides {save {}}} {
 }
 
 # Diskless load swapdb when NOT async_loading (different master replid)
-foreach testType {Successful Aborted} {
+foreach testType {Successful Aborted} rdbchannel {yes no} {
     start_server {tags {"repl external:skip"}} {
         set replica [srv 0 client]
         set replica_host [srv 0 host]
@@ -453,6 +472,7 @@ foreach testType {Successful Aborted} {
             $master config set repl-diskless-sync yes
             $master config set repl-diskless-sync-delay 0
             $master config set save ""
+            $master config set repl-rdb-channel $rdbchannel
             $replica config set repl-diskless-load swapdb
             $replica config set save ""
 
@@ -474,7 +494,7 @@ foreach testType {Successful Aborted} {
                     # Start the replication process
                     $replica replicaof $master_host $master_port
 
-                    test {Diskless load swapdb (different replid): replica enter loading} {
+                    test "Diskless load swapdb (different replid): replica enter loading rdbchannel=$rdbchannel" {
                         # Wait for the replica to start reading the rdb
                         wait_for_condition 100 100 {
                             [s -1 loading] eq 1
@@ -498,7 +518,7 @@ foreach testType {Successful Aborted} {
                         fail "Replica didn't disconnect"
                     }
 
-                    test {Diskless load swapdb (different replid): old database is exposed after replication fails} {
+                    test "Diskless load swapdb (different replid): old database is exposed after replication fails rdbchannel=$rdbchannel" {
                         # Ensure we see old values from replica
                         assert_equal [$replica get mykey] "myvalue"
 
@@ -590,8 +610,8 @@ foreach testType {Successful Aborted} {
 
             if {$testType == "Aborted"} {
                 # Set master with a slow rdb generation, so that we can easily intercept loading
-                # 10ms per key, with 2000 keys is 20 seconds
-                $master config set rdb-key-save-delay 10000
+                # 20ms per key, with 2000 keys is 40 seconds
+                $master config set rdb-key-save-delay 20000
             }
 
             # Force the replica to try another full sync (this time it will have matching master replid)
@@ -652,7 +672,6 @@ foreach testType {Successful Aborted} {
                     }
 
                     test {Blocked commands and configs during async-loading} {
-                        assert_error {LOADING*} {$replica config set appendonly no}
                         assert_error {LOADING*} {$replica REPLICAOF no one}
                     }
 
@@ -863,6 +882,7 @@ start_server {tags {"repl external:skip"} overrides {save ""}} {
     # we also need the replica to process requests during transfer (which it does only once in 2mb)
     $master debug populate 20000 test 10000
     $master config set rdbcompression no
+    $master config set repl-rdb-channel no
     # If running on Linux, we also measure utime/stime to detect possible I/O handling issues
     set os [catch {exec uname}]
     set measure_time [expr {$os == "Linux"} ? 1 : 0]
@@ -1010,6 +1030,7 @@ test "diskless replication child being killed is collected" {
         set master_pid [srv 0 pid]
         $master config set repl-diskless-sync yes
         $master config set repl-diskless-sync-delay 0
+        $master config set repl-rdb-channel no
         # put enough data in the db that the rdb file will be bigger than the socket buffers
         $master debug populate 20000 test 10000
         $master config set rdbcompression no
@@ -1270,7 +1291,8 @@ start_server {tags {"repl external:skip"}} {
                 r slaveof $master2_host $master2_port
                 wait_for_condition 50 100 {
                     ([s -2 rdb_bgsave_in_progress] == 1) &&
-                    ([string match "*wait_bgsave*" [s -2 slave0]])
+                        ([string match "*wait_bgsave*" [s -2 slave0]] ||
+                         [string match "*send_bulk_and_stream*" [s -2 slave0]])
                 } else {
                     fail "full sync didn't start"
                 }
@@ -1454,6 +1476,146 @@ start_server {tags {"repl external:skip"}} {
 
             assert_equal "set" [$master type s]
             assert_equal "set" [$slave type s]
+        }
+    }
+}
+
+foreach disklessload {disabled on-empty-db} {
+    test "Replica should reply LOADING while flushing a large db (disklessload: $disklessload)" {
+        start_server {} {
+            set replica [srv 0 client]
+            start_server {} {
+                set master [srv 0 client]
+                set master_host [srv 0 host]
+                set master_port [srv 0 port]
+
+                $replica config set repl-diskless-load $disklessload
+
+                # Populate replica with many keys, master with a few keys.
+                $replica debug populate 2000000
+                populate 3 master 10
+
+                # Start the replication process...
+                $replica replicaof $master_host $master_port
+
+                wait_for_condition 100 100 {
+                    [s -1 loading] eq 1
+                } else {
+                    fail "Replica didn't get into loading mode"
+                }
+
+                # If replica has a large db, it may take some time to discard it
+                # after receiving new db from the master. In this case, replica
+                # should reply -LOADING. Replica may reply -LOADING while
+                # loading the new db as well. To test the first case, populated
+                # replica with large amount of keys and master with a few keys.
+                # Discarding old db will take a long time and loading new one
+                # will be quick. So, if we receive -LOADING, most probably it is
+                # when flushing the db.
+                wait_for_condition 1 10000 {
+                    [catch {$replica ping} err] &&
+                    [string match *LOADING* $err]
+                } else {
+                    # There is a chance that we may not catch LOADING response
+                    # if flushing db happens too fast compared to test execution
+                    # Then, we may consider increasing key count or introducing
+                    # artificial delay to db flush.
+                    fail "Replica did not reply LOADING."
+                }
+
+                catch {$replica shutdown nosave}
+            }
+        }
+    } {} {repl external:skip}
+}
+
+start_server {tags {"repl external:skip"} overrides {save {}}} {
+    set master [srv 0 client]
+    set master_host [srv 0 host]
+    set master_port [srv 0 port]
+    populate 10000 master 10
+
+    start_server {overrides {save {} rdb-del-sync-files yes loading-process-events-interval-bytes 1024}} {
+        test "Allow appendonly config change while loading rdb on slave" {
+            set replica [srv 0 client]
+
+            # While loading rdb on slave, verify appendonly config changes are allowed
+            # 1- Change appendonly config from no to yes
+            $replica config set appendonly no
+            $replica config set key-load-delay 100
+            $replica debug populate 1000
+
+            # Start the replication process...
+            $replica replicaof $master_host $master_port
+
+            wait_for_condition 10 1000 {
+                [s loading] eq 1
+            } else {
+                fail "Replica didn't get into loading mode"
+            }
+
+            # Change config while replica is loading data
+            $replica config set appendonly yes
+            assert_equal 1 [s loading]
+
+            # Speed up loading and verify aof is enabled
+            $replica config set key-load-delay 0
+            wait_done_loading $replica
+            assert_equal 1 [s aof_enabled]
+
+            # Quick sanity for AOF
+            $replica replicaof no one
+            set prev [s aof_current_size]
+            $replica set x 100
+            assert_morethan [s aof_current_size] $prev
+
+            # 2- While loading rdb, change appendonly from yes to no
+            $replica config set appendonly yes
+            $replica config set key-load-delay 100
+            $replica flushall
+
+            # Start the replication process...
+            $replica replicaof $master_host $master_port
+
+            wait_for_condition 10 1000 {
+                [s loading] eq 1
+            } else {
+                fail "Replica didn't get into loading mode"
+            }
+
+            # Change config while replica is loading data
+            $replica config set appendonly no
+            assert_equal 1 [s loading]
+
+            # Speed up loading and verify aof is disabled
+            $replica config set key-load-delay 0
+            wait_done_loading $replica
+            assert_equal 0 [s 0 aof_enabled]
+        }
+    }
+}
+
+start_server {tags {"repl external:skip"}} {
+    set replica [srv 0 client]
+    start_server {} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+
+        test "Replica flushes db lazily when replica-lazy-flush enabled" {
+            $replica config set replica-lazy-flush yes
+            $replica debug populate 1000
+            populate 1 master 10
+
+            # Start the replication process...
+            $replica replicaof $master_host $master_port
+
+            wait_for_condition 100 100 {
+                [s -1 lazyfreed_objects] >= 1000 &&
+                [s -1 master_link_status] eq {up}
+            } else {
+                fail "Replica did not free db lazily"
+            }
         }
     }
 }
